@@ -6,8 +6,47 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import google.generativeai as genai
 from datetime import datetime
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import atexit
 import warnings
+
 warnings.filterwarnings('ignore')
+
+# === FIX FOR YFINANCE DATA LEAK (UNCLOSED SOCKET) ===
+def create_requests_session():
+    """Create a requests session with proper retry and cleanup"""
+    session = requests.Session()
+    
+    # Add retry strategy
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    
+    # Patch close to ensure cleanup
+    original_close = session.close
+
+    def safe_close():
+        try:
+            session.adapters.clear()
+            original_close()
+        except:
+            pass
+
+    session.close = safe_close
+    return session
+
+# Create global session for yfinance
+SESSION = create_requests_session()
+atexit.register(SESSION.close)  # Ensure session closes on exit
+
+# === END DATA LEAK FIX ===
 
 # Configure page
 st.set_page_config(
@@ -44,6 +83,13 @@ st.markdown("""
         color: #666;
         font-size: 0.9rem;
     }
+    .warning {
+        padding: 1rem;
+        background-color: #fff3cd;
+        border: 1px solid #ffeaa7;
+        border-radius: 5px;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -58,7 +104,7 @@ st.markdown("---")
 # API Key input (sidebar)
 with st.sidebar:
     st.header("🔑 API Configuration")
-    api_key = st.text_input("Enter Gemini API Key:", type="password")
+    api_key = st.text_input("Enter Gemini API Key:", type="password", key="api_input")
     
     if api_key:
         st.session_state.api_key_set = True
@@ -145,8 +191,6 @@ def get_stock_symbol(stock_name: str) -> str:
         'hero motocorp': 'HEROMOTOCO.NS',
         'eicher motors': 'EICHERMOT.NS',
         'tata steel': 'TATASTEEL.NS',
-        'tata motors': 'TATAMOTORS.NS',
-        'tcs': 'TCS.NS',
         'lupin': 'LUPIN.NS',
         'cipla': 'CIPLA.NS',
         'dr reddy': 'DRREDDY.NS',
@@ -155,359 +199,227 @@ def get_stock_symbol(stock_name: str) -> str:
     }
     
     stock_name_lower = stock_name.lower().strip()
-    if stock_name_lower in stock_mappings:
-        return stock_mappings[stock_name_lower]
-    else:
-        # Try to construct symbol
-        symbol = stock_name.upper().replace(' ', '') + '.NS'
-        return symbol
+    return stock_mappings.get(stock_name_lower, stock_name.upper().replace(' ', '') + '.NS')
 
 # Fetch and process data
-@st.cache_data(show_spinner=False)
-def fetch_quarterly_financials(symbol: str) -> pd.DataFrame:
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_quarterly_financials(symbol: str):
     try:
-        with st.spinner(f"Fetching data for {symbol}..."):
-            stock = yf.Ticker(symbol)
+        with st.spinner(f"📊 Fetching financial data for {symbol}..."):
+            # Use the patched session
+            stock = yf.Ticker(symbol, session=SESSION)
             
-            # Get quarterly financial statements
             quarterly_income = stock.quarterly_financials
-            
             if quarterly_income.empty:
-                raise ValueError(f"No financial data found for {symbol}")
+                raise ValueError("No quarterly financial data available.")
             
-            # Extract required metrics
-            quarters = quarterly_income.columns[:10]  # Last 10 quarters
-            
+            quarters = quarterly_income.columns[:10]
             data = []
+            
             for quarter in quarters:
                 try:
-                    # Handle different column name variations
-                    sales_cols = ['Total Revenue', 'Revenue', 'Total Revenues', 'Net Sales']
-                    operating_income_cols = ['Operating Income', 'Operating Profit', 'EBIT Operating Income']
-                    net_income_cols = ['Net Income', 'Net Income Common Stockholders', 'Net Income To Common Shareholders']
-                    
-                    # Get Sales/Revenue
+                    # Revenue
                     sales = None
-                    for col in sales_cols:
+                    for col in ['Total Revenue', 'Revenue']:
                         if col in quarterly_income.index:
                             sales = quarterly_income.loc[col, quarter]
                             break
                     if sales is None:
-                        sales = quarterly_income.loc[quarterly_income.index[0], quarter]
+                        sales = quarterly_income.iloc[0, quarterly_income.columns.get_loc(quarter)]
                     
-                    # Get Operating Profit
-                    operating_profit = None
-                    for col in operating_income_cols:
+                    # Operating Profit
+                    op_profit = None
+                    for col in ['Operating Income', 'Operating Profit', 'EBIT']:
                         if col in quarterly_income.index:
-                            operating_profit = quarterly_income.loc[col, quarter]
+                            op_profit = quarterly_income.loc[col, quarter]
                             break
-                    if operating_profit is None:
-                        # Calculate from EBIT if available
-                        ebit_cols = ['EBIT', 'Earnings Before Interest and Taxes']
-                        for col in ebit_cols:
-                            if col in quarterly_income.index:
-                                operating_profit = quarterly_income.loc[col, quarter]
-                                break
                     
-                    # Get Net Profit
+                    # Net Profit
                     net_profit = None
-                    for col in net_income_cols:
+                    for col in ['Net Income', 'Net Income Common Stockholders']:
                         if col in quarterly_income.index:
                             net_profit = quarterly_income.loc[col, quarter]
                             break
                     
-                    # Calculate metrics
-                    if sales and operating_profit:
-                        opm_percent = (operating_profit / sales) * 100
-                    else:
-                        opm_percent = None
+                    # OPM %
+                    opm = ((op_profit / sales) * 100) if sales and op_profit and sales != 0 else None
                     
-                    # Get shares outstanding for EPS calculation
-                    shares_outstanding = None
-                    try:
-                        shares_data = stock.info.get('sharesOutstanding', None)
-                        if shares_outstanding:
-                            shares_outstanding = shares_data
-                        else:
-                            shares_hist = stock.get_shares_full()
-                            if shares_hist is not None and len(shares_hist) > 0:
-                                shares_outstanding = shares_hist.iloc[-1]
-                    except:
-                        pass
-                    
+                    # EPS (simplified)
                     eps = None
-                    if net_profit and shares_outstanding:
-                        eps = net_profit / shares_outstanding
+                    if net_profit:
+                        try:
+                            shares = stock.info.get('sharesOutstanding', 1e6)
+                            eps = net_profit / shares
+                        except:
+                            pass
                     
                     data.append({
                         'Quarter': quarter.strftime('%Y-%m'),
                         'Sales': sales,
-                        'Operating_Profit': operating_profit,
-                        'OPM_Percent': opm_percent,
+                        'Operating_Profit': op_profit,
+                        'OPM_Percent': opm,
                         'Net_Profit': net_profit,
                         'EPS': eps
                     })
-                except Exception as e:
+                except:
                     continue
             
             df = pd.DataFrame(data)
-            
-            # Clean and format the data
-            numeric_columns = ['Sales', 'Operating_Profit', 'OPM_Percent', 'Net_Profit', 'EPS']
-            for col in numeric_columns:
+            numeric_cols = ['Sales', 'Operating_Profit', 'OPM_Percent', 'Net_Profit', 'EPS']
+            for col in numeric_cols:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            return df
-        
+            return df.dropna(how='all')  # Remove any all-NaN rows
+    
     except Exception as e:
-        raise Exception(f"Error fetching data for {symbol}: {str(e)}")
+        st.error(f"❌ Failed to fetch data: {str(e)}")
+        return pd.DataFrame()
 
-# Format numbers for display
+# Format numbers
 def format_numbers(df: pd.DataFrame) -> pd.DataFrame:
     formatted_df = df.copy()
-    
-    # Format large numbers in crores
     for col in ['Sales', 'Operating_Profit', 'Net_Profit']:
         if col in formatted_df.columns:
             formatted_df[col] = formatted_df[col].apply(
-                lambda x: f"₹{x/10000000:.2f} Cr" if pd.notnull(x) and x != 0 else "N/A"
+                lambda x: f"₹{x/1e7:.2f} Cr" if pd.notnull(x) and x != 0 else "N/A"
             )
-    
-    # Format percentages
-    if 'OPM_Percent' in formatted_df.columns:
-        formatted_df['OPM_Percent'] = formatted_df['OPM_Percent'].apply(
-            lambda x: f"{x:.2f}%" if pd.notnull(x) else "N/A"
-        )
-    
-    # Format EPS
-    if 'EPS' in formatted_df.columns:
-        formatted_df['EPS'] = formatted_df['EPS'].apply(
-            lambda x: f"₹{x:.2f}" if pd.notnull(x) else "N/A"
-        )
-    
+    formatted_df['OPM_Percent'] = formatted_df['OPM_Percent'].apply(
+        lambda x: f"{x:.2f}%" if pd.notnull(x) else "N/A"
+    )
+    formatted_df['EPS'] = formatted_df['EPS'].apply(
+        lambda x: f"₹{x:.2f}" if pd.notnull(x) else "N/A"
+    )
     return formatted_df
 
 # Create visualizations
 def create_visualizations(df: pd.DataFrame):
-    # Convert back to numeric for plotting
     plot_df = df.copy()
     for col in ['Sales', 'Operating_Profit', 'Net_Profit']:
-        if col in plot_df.columns:
-            plot_df[col] = plot_df[col].apply(
-                lambda x: float(x.replace('₹', '').replace(' Cr', '')) * 10000000 if isinstance(x, str) and x != 'N/A' else (x if pd.notnull(x) else 0)
-            )
-    
-    if 'OPM_Percent' in plot_df.columns:
-        plot_df['OPM_Percent'] = plot_df['OPM_Percent'].apply(
-            lambda x: float(x.replace('%', '')) if isinstance(x, str) and x != 'N/A' else (x if pd.notnull(x) else 0)
+        plot_df[col] = plot_df[col].apply(
+            lambda x: float(str(x).replace('₹', '').replace(' Cr', '')) * 1e7 if isinstance(x, str) and 'Cr' in str(x) else (x if pd.notnull(x) else 0)
         )
-    
-    if 'EPS' in plot_df.columns:
-        plot_df['EPS'] = plot_df['EPS'].apply(
-            lambda x: float(x.replace('₹', '')) if isinstance(x, str) and x != 'N/A' else (x if pd.notnull(x) else 0)
-        )
-    
-    # Create subplots
+    plot_df['OPM_Percent'] = plot_df['OPM_Percent'].apply(
+        lambda x: float(str(x).replace('%', '')) if isinstance(x, str) and '%' in str(x) else (x if pd.notnull(x) else 0)
+    )
+    plot_df['EPS'] = plot_df['EPS'].apply(
+        lambda x: float(str(x).replace('₹', '')) if isinstance(x, str) and '₹' in str(x) else (x if pd.notnull(x) else 0)
+    )
+
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle(f'Quarterly Financial Analysis - {stock_name.upper()}', fontsize=16, fontweight='bold')
-    
-    # 1. Sales and Profits trend
-    ax1 = axes[0, 0]
+    fig.suptitle(f'Financial Trends - {stock_name.title()}', fontsize=16, fontweight='bold')
     x_pos = range(len(plot_df))
-    ax1.plot(x_pos, plot_df['Sales'], marker='o', linewidth=2, label='Sales (₹Cr)', color='#1f77b4')
-    ax1.plot(x_pos, plot_df['Operating_Profit'], marker='s', linewidth=2, label='Operating Profit (₹Cr)', color='#ff7f0e')
-    ax1.plot(x_pos, plot_df['Net_Profit'], marker='^', linewidth=2, label='Net Profit (₹Cr)', color='#2ca02c')
-    ax1.set_title('Revenue and Profit Trends')
-    ax1.set_xlabel('Quarters')
-    ax1.set_ylabel('Amount (₹Cr)')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    ax1.set_xticks(x_pos)
-    ax1.set_xticklabels(plot_df['Quarter'], rotation=45)
-    
-    # 2. OPM Percentage trend
-    ax2 = axes[0, 1]
-    bars = ax2.bar(x_pos, plot_df['OPM_Percent'], color='#2ca02c', alpha=0.7)
-    ax2.set_title('Operating Profit Margin (OPM %)')
-    ax2.set_xlabel('Quarters')
-    ax2.set_ylabel('OPM (%)')
-    ax2.grid(True, alpha=0.3)
-    ax2.set_xticks(x_pos)
-    ax2.set_xticklabels(plot_df['Quarter'], rotation=45)
-    
-    # Color bars based on value
-    for i, bar in enumerate(bars):
-        if i < len(plot_df['OPM_Percent']):
-            value = plot_df['OPM_Percent'].iloc[i]
-            bar.set_color('green' if value > 0 else 'red')
-    
-    # 3. EPS trend
-    ax3 = axes[1, 0]
-    ax3.plot(x_pos, plot_df['EPS'], marker='D', linewidth=2, color='#9467bd')
-    ax3.set_title('Earnings Per Share (EPS)')
-    ax3.set_xlabel('Quarters')
-    ax3.set_ylabel('EPS (₹)')
-    ax3.grid(True, alpha=0.3)
-    ax3.set_xticks(x_pos)
-    ax3.set_xticklabels(plot_df['Quarter'], rotation=45)
-    
-    # 4. Profitability heatmap
-    ax4 = axes[1, 1]
-    heatmap_data = plot_df[['OPM_Percent']].copy()
-    heatmap_data = heatmap_data.set_index(plot_df['Quarter'])
-    sns.heatmap(heatmap_data.T, annot=True, fmt='.2f', cmap='RdYlGn', ax=ax4, cbar_kws={'label': 'OPM %'})
-    ax4.set_title('OPM Trend Heatmap')
-    
+
+    axes[0,0].plot(x_pos, plot_df['Sales']/1e7, 'o-', label='Sales (Cr)', color='#1f77b4')
+    axes[0,0].plot(x_pos, plot_df['Operating_Profit']/1e7, 's-', label='Op Profit (Cr)', color='#ff7f0e')
+    axes[0,0].plot(x_pos, plot_df['Net_Profit']/1e7, '^-', label='Net Profit (Cr)', color='#2ca02c')
+    axes[0,0].set_title('Revenue & Profit (₹ Cr)')
+    axes[0,0].legend()
+    axes[0,0].grid(True, alpha=0.3)
+    axes[0,0].set_xticks(x_pos)
+    axes[0,0].set_xticklabels(plot_df['Quarter'], rotation=45)
+
+    axes[0,1].bar(x_pos, plot_df['OPM_Percent'], color='#2ca02c', alpha=0.7)
+    axes[0,1].set_title('OPM %')
+    axes[0,1].grid(True, alpha=0.3)
+    axes[0,1].set_xticks(x_pos)
+    axes[0,1].set_xticklabels(plot_df['Quarter'], rotation=45)
+
+    axes[1,0].plot(x_pos, plot_df['EPS'], 'D-', color='#9467bd')
+    axes[1,0].set_title('EPS (₹)')
+    axes[1,0].grid(True, alpha=0.3)
+    axes[1,0].set_xticks(x_pos)
+    axes[1,0].set_xticklabels(plot_df['Quarter'], rotation=45)
+
+    sns.heatmap(plot_df[['OPM_Percent']].T, annot=True, fmt='.2f', cmap='RdYlGn', ax=axes[1,1], cbar_kws={'label': 'OPM %'})
+    axes[1,1].set_title('OPM Heatmap')
+
     plt.tight_layout()
     return fig
 
-# Prepare data for AI analysis
+# Prepare AI data
 def prepare_ai_analysis_data(df: pd.DataFrame) -> str:
-    # Convert to clean numeric format for analysis
     analysis_df = df.copy()
-    
-    # Remove formatting for AI analysis
     for col in ['Sales', 'Operating_Profit', 'Net_Profit']:
-        if col in analysis_df.columns:
-            analysis_df[col] = analysis_df[col].apply(
-                lambda x: float(x.replace('₹', '').replace(' Cr', '')) * 10000000 if isinstance(x, str) and x != 'N/A' else (x if pd.notnull(x) else 0)
-            )
-    
-    if 'OPM_Percent' in analysis_df.columns:
-        analysis_df['OPM_Percent'] = analysis_df['OPM_Percent'].apply(
-            lambda x: float(x.replace('%', '')) if isinstance(x, str) and x != 'N/A' else (x if pd.notnull(x) else 0)
+        analysis_df[col] = analysis_df[col].apply(
+            lambda x: float(str(x).replace('₹', '').replace(' Cr', '')) * 1e7 if isinstance(x, str) else (x if pd.notnull(x) else 0)
         )
-    
-    if 'EPS' in analysis_df.columns:
-        analysis_df['EPS'] = analysis_df['EPS'].apply(
-            lambda x: float(x.replace('₹', '')) if isinstance(x, str) and x != 'N/A' else (x if pd.notnull(x) else 0)
-        )
-    
-    # Create summary statistics
-    summary_stats = {
-        'average_sales': analysis_df['Sales'].mean(),
-        'average_opm': analysis_df['OPM_Percent'].mean(),
-        'average_eps': analysis_df['EPS'].mean(),
-        'sales_growth': ((analysis_df['Sales'].iloc[0] - analysis_df['Sales'].iloc[-1]) / analysis_df['Sales'].iloc[-1] * 100) if len(analysis_df) > 1 and analysis_df['Sales'].iloc[-1] != 0 else 0,
-        'profit_growth': ((analysis_df['Net_Profit'].iloc[0] - analysis_df['Net_Profit'].iloc[-1]) / analysis_df['Net_Profit'].iloc[-1] * 100) if len(analysis_df) > 1 and analysis_df['Net_Profit'].iloc[-1] != 0 else 0
-    }
-    
-    # Prepare data string for AI
-    data_string = f"""
-    Financial Analysis for Indian Stock: {stock_name.upper()}
-    ==================================
-    
-    Last 10 Quarters Data:
-    {analysis_df.to_string(index=False)}
-    
-    Summary Statistics:
-    - Average Quarterly Sales: ₹{summary_stats['average_sales']/10000000:.2f} Cr
-    - Average OPM: {summary_stats['average_opm']:.2f}%
-    - Average EPS: ₹{summary_stats['average_eps']:.2f}
-    - Sales Growth (latest vs oldest quarter): {summary_stats['sales_growth']:.2f}%
-    - Profit Growth (latest vs oldest quarter): {summary_stats['profit_growth']:.2f}%
+    analysis_df['OPM_Percent'] = analysis_df['OPM_Percent'].apply(
+        lambda x: float(str(x).replace('%', '')) if isinstance(x, str) else (x if pd.notnull(x) else 0)
+    )
+    analysis_df['EPS'] = analysis_df['EPS'].apply(
+        lambda x: float(str(x).replace('₹', '')) if isinstance(x, str) else (x if pd.notnull(x) else 0)
+    )
+
+    latest = analysis_df.iloc[0]
+    return f"""
+    Stock: {stock_name.upper()}
+    Latest Sales: ₹{latest['Sales']/1e7:.2f} Cr
+    OPM: {latest['OPM_Percent']:.2f}%
+    EPS: ₹{latest['EPS']:.2f}
+    Net Profit: ₹{latest['Net_Profit']/1e7:.2f} Cr
     """
-    
-    return data_string
 
 # AI analysis
-@st.cache_data(show_spinner=False)
-def ai_analysis(data_string: str, _api_key: str) -> str:
+@st.cache_data(ttl=3600)
+def get_ai_analysis(data_str: str, api_key: str):
     try:
-        genai.configure(api_key=_api_key)
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-pro')
-        
         prompt = f"""
-        As a financial analyst, analyze the following quarterly financial data for an Indian company. 
-        Provide insights on:
+        Analyze this Indian stock's quarterly performance:
+        {data_str}
         
-        1. Sales Performance: Trend analysis, growth patterns, seasonal variations
-        2. Profitability Analysis: Operating profit margin trends, net profit performance
-        3. EPS Analysis: Earnings per share trends and implications
-        4. Overall Financial Health: Company's financial position based on the data
-        5. Key Concerns: Any red flags or areas of concern
-        6. Future Outlook: Based on trends, what to expect going forward
-        7. Investment Perspective: Brief view on investment potential
-        
-        {data_string}
-        
-        Provide a comprehensive but concise analysis in clear sections.
+        Provide concise insights on: Sales trend, Profitability, EPS growth, Risks, and Investment view.
         """
-        
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"AI Analysis failed: {str(e)}"
+        return f"AI analysis failed: {str(e)}"
 
-# Main execution
+# === MAIN EXECUTION ===
 try:
     symbol = get_stock_symbol(stock_name)
-    st.info(f"🔍 Analyzing: {stock_name.upper()} ({symbol})")
-    
-    # Fetch data
+    st.info(f"🔍 Analyzing: **{stock_name.title()}** ({symbol})")
+
     raw_data = fetch_quarterly_financials(symbol)
-    
-    if raw_data.empty:
-        st.error("❌ No financial data available for this stock. Please check the stock name.")
-        st.stop()
-    
-    # Format for display
-    display_data = format_numbers(raw_data)
-    
-    # Display key metrics
-    st.markdown('<h2 class="sub-header">📈 Key Financial Metrics</h2>', unsafe_allow_html=True)
-    
-    latest_data = raw_data.iloc[0]  # Most recent quarter
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("Latest Sales", 
-                  f"₹{latest_data['Sales']/10000000:.2f} Cr" if pd.notnull(latest_data['Sales']) else "N/A")
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("Operating Profit", 
-                  f"₹{latest_data['Operating_Profit']/10000000:.2f} Cr" if pd.notnull(latest_data['Operating_Profit']) else "N/A")
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("OPM %", 
-                  f"{latest_data['OPM_Percent']:.2f}%" if pd.notnull(latest_data['OPM_Percent']) else "N/A")
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col4:
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("Net Profit", 
-                  f"₹{latest_data['Net_Profit']/10000000:.2f} Cr" if pd.notnull(latest_data['Net_Profit']) else "N/A")
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col5:
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("EPS", 
-                  f"₹{latest_data['EPS']:.2f}" if pd.notnull(latest_data['EPS']) else "N/A")
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Display data table
-    st.markdown('<h2 class="sub-header">📋 Quarterly Financial Data</h2>', unsafe_allow_html=True)
-    st.dataframe(display_data, use_container_width=True)
-    
-    # Display visualizations
-    st.markdown('<h2 class="sub-header">📊 Financial Trends</h2>', unsafe_allow_html=True)
-    fig = create_visualizations(raw_data)
-    st.pyplot(fig)
-    
-    # AI Analysis
-    st.markdown('<h2 class="sub-header">🤖 AI-Powered Analysis</h2>', unsafe_allow_html=True)
-    with st.spinner("Generating AI analysis..."):
-        ai_input_data = prepare_ai_analysis_data(raw_data)
-        ai_result = ai_analysis(ai_input_data, api_key)
-        st.markdown(ai_result)
-    
+    if raw_data.empty or len(raw_data) == 0:
+        st.error("❌ No financial data found. Please check the stock name.")
+    else:
+        display_data = format_numbers(raw_data)
+
+        # Metrics
+        st.markdown('<h2 class="sub-header">📈 Key Metrics</h2>', unsafe_allow_html=True)
+        cols = st.columns(5)
+        latest = raw_data.iloc[0]
+        metrics = [
+            ("Sales", f"₹{latest['Sales']/1e7:.2f} Cr" if pd.notnull(latest['Sales']) else "N/A"),
+            ("Op Profit", f"₹{latest['Operating_Profit']/1e7:.2f} Cr" if pd.notnull(latest['Operating_Profit']) else "N/A"),
+            ("OPM %", f"{latest['OPM_Percent']:.2f}%" if pd.notnull(latest['OPM_Percent']) else "N/A"),
+            ("Net Profit", f"₹{latest['Net_Profit']/1e7:.2f} Cr" if pd.notnull(latest['Net_Profit']) else "N/A"),
+            ("EPS", f"₹{latest['EPS']:.2f}" if pd.notnull(latest['EPS']) else "N/A")
+        ]
+        for col, (label, value) in zip(cols, metrics):
+            with col:
+                st.markdown(f'<div class="metric-card"><b>{label}</b><br>{value}</div>', unsafe_allow_html=True)
+
+        # Table
+        st.markdown('<h2 class="sub-header">📋 Quarterly Data</h2>', unsafe_allow_html=True)
+        st.dataframe(display_data, use_container_width=True)
+
+        # Charts
+        st.markdown('<h2 class="sub-header">📊 Financial Trends</h2>', unsafe_allow_html=True)
+        fig = create_visualizations(raw_data)
+        st.pyplot(fig)
+
+        # AI Analysis
+        st.markdown('<h2 class="sub-header">🤖 AI Analysis</h2>', unsafe_allow_html=True)
+        with st.spinner("Generating AI insights..."):
+            ai_input = prepare_ai_analysis_data(raw_data)
+            ai_result = get_ai_analysis(ai_input, api_key)
+            st.markdown(ai_result)
+
 except Exception as e:
     st.error(f"❌ Error: {str(e)}")
 
 # Footer
-st.markdown('<div class="footer">📊 Indian Stock Financial Analyzer | Powered by Yahoo Finance & Gemini AI</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">📊 Indian Stock Analyzer | Data: Yahoo Finance | AI: Gemini</div>', unsafe_allow_html=True)
