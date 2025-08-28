@@ -2,424 +2,330 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import google.generativeai as genai
-from datetime import datetime
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import atexit
+from datetime import datetime, timedelta
 import warnings
-
 warnings.filterwarnings('ignore')
 
-# === FIX FOR YFINANCE DATA LEAK (UNCLOSED SOCKET) ===
-def create_requests_session():
-    """Create a requests session with proper retry and cleanup"""
-    session = requests.Session()
-    
-    # Add retry strategy
-    retry = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    
-    # Patch close to ensure cleanup
-    original_close = session.close
-
-    def safe_close():
-        try:
-            session.adapters.clear()
-            original_close()
-        except:
-            pass
-
-    session.close = safe_close
-    return session
-
-# Create global session for yfinance
-SESSION = create_requests_session()
-atexit.register(SESSION.close)  # Ensure session closes on exit
-
-# === END DATA LEAK FIX ===
-
-# Configure page
+# Set up the page
 st.set_page_config(
-    page_title="Indian Stock Analyzer",
-    page_icon="📊",
+    page_title="Indian Stock Financial Analysis",
+    page_icon="📈",
     layout="wide"
 )
 
-# Custom CSS
+# Title and description
+st.title("📈 Indian Stock Financial Analysis Tool")
 st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        color: #2ca02c;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 10px;
-        margin: 0.5rem;
-        text-align: center;
-    }
-    .footer {
-        text-align: center;
-        margin-top: 3rem;
-        color: #666;
-        font-size: 0.9rem;
-    }
-    .warning {
-        padding: 1rem;
-        background-color: #fff3cd;
-        border: 1px solid #ffeaa7;
-        border-radius: 5px;
-        margin: 1rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+This tool fetches the latest 10 quarters of financial data for any Indian stock and provides AI-driven analysis using Gemini API.
+Enter a stock symbol (e.g., RELIANCE.NS, TCS.NS, INFY.NS) to get started.
+""")
 
-# Initialize session state
-if 'api_key_set' not in st.session_state:
-    st.session_state.api_key_set = False
+# Initialize session state for API key and data
+if 'api_key' not in st.session_state:
+    st.session_state.api_key = ''
+if 'financial_data' not in st.session_state:
+    st.session_state.financial_data = None
+if 'company_name' not in st.session_state:
+    st.session_state.company_name = ''
 
-# Main header
-st.markdown('<h1 class="main-header">📊 Indian Stock Financial Analyzer</h1>', unsafe_allow_html=True)
-st.markdown("---")
-
-# API Key input (sidebar)
+# Sidebar for API key input
 with st.sidebar:
-    st.header("🔑 API Configuration")
-    api_key = st.text_input("Enter Gemini API Key:", type="password", key="api_input")
-    
+    st.header("Configuration")
+    api_key = st.text_input("Enter your Gemini API Key:", type="password", value=st.session_state.api_key)
     if api_key:
-        st.session_state.api_key_set = True
-        try:
-            genai.configure(api_key=api_key)
-            st.success("✅ API Key configured successfully!")
-        except Exception as e:
-            st.error(f"❌ Error configuring API: {str(e)}")
-            st.session_state.api_key_set = False
+        st.session_state.api_key = api_key
+        st.success("API key saved!")
     
     st.markdown("---")
-    st.header("ℹ️ About")
     st.info("""
-    This tool analyzes Indian stocks by fetching:
-    - Last 10 quarters of financial data
-    - Sales, Operating Profit, OPM%, Net Profit, EPS
-    - Visual charts and AI-powered analysis
-    
-    Enter any Indian stock name to get started!
+    **Note:** 
+    - Indian stocks typically have the '.NS' suffix (NSE)
+    - You need a Gemini API key for the analysis feature
+    - Example symbols: RELIANCE.NS, TCS.NS, INFY.NS, HDFCBANK.NS, SBIN.NS
     """)
 
-# Main content
-if not st.session_state.api_key_set:
-    st.warning("⚠️ Please enter your Gemini API Key in the sidebar to use this tool.")
-    st.stop()
-
-# Stock input
-col1, col2 = st.columns([3, 1])
-with col1:
-    stock_name = st.text_input("Enter Indian Stock Name:", placeholder="e.g., Reliance, TCS, HDFC Bank")
-with col2:
-    analyze_button = st.button("🔍 Analyze Stock", type="primary", use_container_width=True)
-
-if not stock_name:
-    st.info("👆 Please enter an Indian stock name to begin analysis.")
-    st.stop()
-
-if not analyze_button:
-    st.info("👆 Click 'Analyze Stock' to fetch financial data.")
-    st.stop()
-
-# Stock symbol mapping
-def get_stock_symbol(stock_name: str) -> str:
-    stock_mappings = {
-        'reliance': 'RELIANCE.NS',
-        'tcs': 'TCS.NS',
-        'hdfc bank': 'HDFCBANK.NS',
-        'infosys': 'INFY.NS',
-        'icici bank': 'ICICIBANK.NS',
-        'hdfc': 'HDFC.NS',
-        'sbi': 'SBIN.NS',
-        'kotak mahindra': 'KOTAKBANK.NS',
-        'bajaj finance': 'BAJFINANCE.NS',
-        'hindustan unilever': 'HINDUNILVR.NS',
-        'itc': 'ITC.NS',
-        'wipro': 'WIPRO.NS',
-        'axis bank': 'AXISBANK.NS',
-        'l&t': 'LT.NS',
-        'maruti suzuki': 'MARUTI.NS',
-        'nestle': 'NESTLEIND.NS',
-        'tatamotors': 'TATAMOTORS.NS',
-        'mahindra & mahindra': 'M&M.NS',
-        'adani enterprises': 'ADANIENT.NS',
-        'adani green': 'ADANIGREEN.NS',
-        'adani ports': 'ADANIPORTS.NS',
-        'asian paints': 'ASIANPAINT.NS',
-        'bharti airtel': 'BHARTIARTL.NS',
-        'ultratech cement': 'ULTRACEMCO.NS',
-        'sun pharmaceutical': 'SUNPHARMA.NS',
-        'hcl technologies': 'HCLTECH.NS',
-        'tech mahindra': 'TECHM.NS',
-        'power grid': 'POWERGRID.NS',
-        'ntpc': 'NTPC.NS',
-        'ongc': 'ONGC.NS',
-        'ioc': 'IOC.NS',
-        'bpcl': 'BPCL.NS',
-        'hpcl': 'HINDPETRO.NS',
-        'coal india': 'COALINDIA.NS',
-        'vedanta': 'VEDL.NS',
-        'hindalco': 'HINDALCO.NS',
-        'grasim': 'GRASIM.NS',
-        'bajaj finserv': 'BAJAJFINSV.NS',
-        'bajaj auto': 'BAJAJ-AUTO.NS',
-        'hero motocorp': 'HEROMOTOCO.NS',
-        'eicher motors': 'EICHERMOT.NS',
-        'tata steel': 'TATASTEEL.NS',
-        'lupin': 'LUPIN.NS',
-        'cipla': 'CIPLA.NS',
-        'dr reddy': 'DRREDDY.NS',
-        'apollo hospitals': 'APOLLOHOSP.NS',
-        'divis labs': 'DIVISLAB.NS'
-    }
-    
-    stock_name_lower = stock_name.lower().strip()
-    return stock_mappings.get(stock_name_lower, stock_name.upper().replace(' ', '') + '.NS')
-
-# Fetch and process data
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_quarterly_financials(symbol: str):
+# Function to fetch stock data
+def fetch_stock_data(symbol):
     try:
-        with st.spinner(f"📊 Fetching financial data for {symbol}..."):
-            # Use the patched session
-            stock = yf.Ticker(symbol, session=SESSION)
-            
-            quarterly_income = stock.quarterly_financials
-            if quarterly_income.empty:
-                raise ValueError("No quarterly financial data available.")
-            
-            quarters = quarterly_income.columns[:10]
-            data = []
-            
-            for quarter in quarters:
-                try:
-                    # Revenue
-                    sales = None
-                    for col in ['Total Revenue', 'Revenue']:
-                        if col in quarterly_income.index:
-                            sales = quarterly_income.loc[col, quarter]
-                            break
-                    if sales is None:
-                        sales = quarterly_income.iloc[0, quarterly_income.columns.get_loc(quarter)]
-                    
-                    # Operating Profit
-                    op_profit = None
-                    for col in ['Operating Income', 'Operating Profit', 'EBIT']:
-                        if col in quarterly_income.index:
-                            op_profit = quarterly_income.loc[col, quarter]
-                            break
-                    
-                    # Net Profit
-                    net_profit = None
-                    for col in ['Net Income', 'Net Income Common Stockholders']:
-                        if col in quarterly_income.index:
-                            net_profit = quarterly_income.loc[col, quarter]
-                            break
-                    
-                    # OPM %
-                    opm = ((op_profit / sales) * 100) if sales and op_profit and sales != 0 else None
-                    
-                    # EPS (simplified)
-                    eps = None
-                    if net_profit:
-                        try:
-                            shares = stock.info.get('sharesOutstanding', 1e6)
-                            eps = net_profit / shares
-                        except:
-                            pass
-                    
-                    data.append({
-                        'Quarter': quarter.strftime('%Y-%m'),
-                        'Sales': sales,
-                        'Operating_Profit': op_profit,
-                        'OPM_Percent': opm,
-                        'Net_Profit': net_profit,
-                        'EPS': eps
-                    })
-                except:
-                    continue
-            
-            df = pd.DataFrame(data)
-            numeric_cols = ['Sales', 'Operating_Profit', 'OPM_Percent', 'Net_Profit', 'EPS']
-            for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            return df.dropna(how='all')  # Remove any all-NaN rows
-    
-    except Exception as e:
-        st.error(f"❌ Failed to fetch data: {str(e)}")
-        return pd.DataFrame()
-
-# Format numbers
-def format_numbers(df: pd.DataFrame) -> pd.DataFrame:
-    formatted_df = df.copy()
-    for col in ['Sales', 'Operating_Profit', 'Net_Profit']:
-        if col in formatted_df.columns:
-            formatted_df[col] = formatted_df[col].apply(
-                lambda x: f"₹{x/1e7:.2f} Cr" if pd.notnull(x) and x != 0 else "N/A"
-            )
-    formatted_df['OPM_Percent'] = formatted_df['OPM_Percent'].apply(
-        lambda x: f"{x:.2f}%" if pd.notnull(x) else "N/A"
-    )
-    formatted_df['EPS'] = formatted_df['EPS'].apply(
-        lambda x: f"₹{x:.2f}" if pd.notnull(x) else "N/A"
-    )
-    return formatted_df
-
-# Create visualizations
-def create_visualizations(df: pd.DataFrame):
-    plot_df = df.copy()
-    for col in ['Sales', 'Operating_Profit', 'Net_Profit']:
-        plot_df[col] = plot_df[col].apply(
-            lambda x: float(str(x).replace('₹', '').replace(' Cr', '')) * 1e7 if isinstance(x, str) and 'Cr' in str(x) else (x if pd.notnull(x) else 0)
-        )
-    plot_df['OPM_Percent'] = plot_df['OPM_Percent'].apply(
-        lambda x: float(str(x).replace('%', '')) if isinstance(x, str) and '%' in str(x) else (x if pd.notnull(x) else 0)
-    )
-    plot_df['EPS'] = plot_df['EPS'].apply(
-        lambda x: float(str(x).replace('₹', '')) if isinstance(x, str) and '₹' in str(x) else (x if pd.notnull(x) else 0)
-    )
-
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle(f'Financial Trends - {stock_name.title()}', fontsize=16, fontweight='bold')
-    x_pos = range(len(plot_df))
-
-    axes[0,0].plot(x_pos, plot_df['Sales']/1e7, 'o-', label='Sales (Cr)', color='#1f77b4')
-    axes[0,0].plot(x_pos, plot_df['Operating_Profit']/1e7, 's-', label='Op Profit (Cr)', color='#ff7f0e')
-    axes[0,0].plot(x_pos, plot_df['Net_Profit']/1e7, '^-', label='Net Profit (Cr)', color='#2ca02c')
-    axes[0,0].set_title('Revenue & Profit (₹ Cr)')
-    axes[0,0].legend()
-    axes[0,0].grid(True, alpha=0.3)
-    axes[0,0].set_xticks(x_pos)
-    axes[0,0].set_xticklabels(plot_df['Quarter'], rotation=45)
-
-    axes[0,1].bar(x_pos, plot_df['OPM_Percent'], color='#2ca02c', alpha=0.7)
-    axes[0,1].set_title('OPM %')
-    axes[0,1].grid(True, alpha=0.3)
-    axes[0,1].set_xticks(x_pos)
-    axes[0,1].set_xticklabels(plot_df['Quarter'], rotation=45)
-
-    axes[1,0].plot(x_pos, plot_df['EPS'], 'D-', color='#9467bd')
-    axes[1,0].set_title('EPS (₹)')
-    axes[1,0].grid(True, alpha=0.3)
-    axes[1,0].set_xticks(x_pos)
-    axes[1,0].set_xticklabels(plot_df['Quarter'], rotation=45)
-
-    sns.heatmap(plot_df[['OPM_Percent']].T, annot=True, fmt='.2f', cmap='RdYlGn', ax=axes[1,1], cbar_kws={'label': 'OPM %'})
-    axes[1,1].set_title('OPM Heatmap')
-
-    plt.tight_layout()
-    return fig
-
-# Prepare AI data
-def prepare_ai_analysis_data(df: pd.DataFrame) -> str:
-    analysis_df = df.copy()
-    for col in ['Sales', 'Operating_Profit', 'Net_Profit']:
-        analysis_df[col] = analysis_df[col].apply(
-            lambda x: float(str(x).replace('₹', '').replace(' Cr', '')) * 1e7 if isinstance(x, str) else (x if pd.notnull(x) else 0)
-        )
-    analysis_df['OPM_Percent'] = analysis_df['OPM_Percent'].apply(
-        lambda x: float(str(x).replace('%', '')) if isinstance(x, str) else (x if pd.notnull(x) else 0)
-    )
-    analysis_df['EPS'] = analysis_df['EPS'].apply(
-        lambda x: float(str(x).replace('₹', '')) if isinstance(x, str) else (x if pd.notnull(x) else 0)
-    )
-
-    latest = analysis_df.iloc[0]
-    return f"""
-    Stock: {stock_name.upper()}
-    Latest Sales: ₹{latest['Sales']/1e7:.2f} Cr
-    OPM: {latest['OPM_Percent']:.2f}%
-    EPS: ₹{latest['EPS']:.2f}
-    Net Profit: ₹{latest['Net_Profit']/1e7:.2f} Cr
-    """
-
-# AI analysis
-@st.cache_data(ttl=3600)
-def get_ai_analysis(data_str: str, api_key: str):
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
-        prompt = f"""
-        Analyze this Indian stock's quarterly performance:
-        {data_str}
+        stock = yf.Ticker(symbol)
+        info = stock.info
         
-        Provide concise insights on: Sales trend, Profitability, EPS growth, Risks, and Investment view.
+        # Get company name
+        company_name = info.get('longName', symbol)
+        
+        # Get financial data
+        financials = stock.quarterly_financials
+        balance_sheet = stock.quarterly_balance_sheet
+        cashflow = stock.quarterly_cashflow
+        
+        if financials.empty:
+            return None, "No quarterly financial data available for this stock."
+        
+        # Get the last 10 quarters
+        quarters = financials.columns[:10]
+        
+        # Extract relevant metrics
+        financial_data = {}
+        
+        # Sales (Total Revenue)
+        if 'Total Revenue' in financials.index:
+            financial_data['Sales'] = financials.loc['Total Revenue', quarters].values[:10] / 10000000  # Convert to Crores
+        else:
+            return None, "Sales data not available for this stock."
+        
+        # Operating Profit (Operating Income)
+        if 'Operating Income' in financials.index:
+            financial_data['Operating Profit'] = financials.loc['Operating Income', quarters].values[:10] / 10000000  # Convert to Crores
+        else:
+            # Calculate operating profit if not directly available
+            if 'Total Revenue' in financials.index and 'Total Operating Expenses' in financials.index:
+                revenue = financials.loc['Total Revenue', quarters].values[:10]
+                opex = financials.loc['Total Operating Expenses', quarters].values[:10]
+                financial_data['Operating Profit'] = (revenue - opex) / 10000000  # Convert to Crores
+            else:
+                financial_data['Operating Profit'] = [0] * 10
+        
+        # Calculate OPM%
+        financial_data['OPM%'] = [
+            (op / sales) * 100 if sales != 0 else 0 
+            for op, sales in zip(financial_data['Operating Profit'], financial_data['Sales'])
+        ]
+        
+        # Net Profit (Net Income)
+        if 'Net Income' in financials.index:
+            financial_data['Net Profit'] = financials.loc['Net Income', quarters].values[:10] / 10000000  # Convert to Crores
+        else:
+            financial_data['Net Profit'] = [0] * 10
+        
+        # EPS (Earnings Per Share)
+        if 'Basic EPS' in financials.index:
+            financial_data['EPS'] = financials.loc['Basic EPS', quarters].values[:10]
+        else:
+            # Calculate EPS from net income and shares outstanding
+            shares_outstanding = info.get('sharesOutstanding')
+            if shares_outstanding and 'Net Profit' in financial_data:
+                # Convert net profit from crores to actual amount and divide by shares
+                financial_data['EPS'] = [
+                    (net_income * 10000000) / shares_outstanding 
+                    for net_income in financial_data['Net Profit']
+                ]
+            else:
+                financial_data['EPS'] = [0] * 10
+        
+        # Format quarter names for display
+        quarter_names = [q.strftime('%Y-Q%q') for q in quarters]
+        
+        # Create DataFrame
+        df = pd.DataFrame(financial_data, index=quarter_names)
+        df.index.name = 'Quarter'
+        
+        # Reverse to show oldest first
+        df = df.iloc[::-1]
+        
+        return df, company_name
+        
+    except Exception as e:
+        return None, f"Error fetching data: {str(e)}"
+
+# Function to generate analysis using Gemini API
+def generate_analysis(company_name, financial_data):
+    if not st.session_state.api_key:
+        return "Please enter your Gemini API key in the sidebar to generate analysis."
+    
+    try:
+        # Configure Gemini API
+        genai.configure(api_key=st.session_state.api_key)
+        model = genai.GenerativeModel('gemini-pro')
+        
+        # Prepare the prompt
+        prompt = f"""
+        Analyze the financial performance of {company_name} based on the following quarterly data (values in Crores INR, except EPS):
+        
+        {financial_data.to_string()}
+        
+        Please provide a comprehensive analysis covering:
+        1. Sales trend and growth pattern
+        2. Operating profit margin (OPM%) trajectory and what it indicates
+        3. Net profit performance and its relation to operating profit
+        4. EPS growth and what it means for investors
+        5. Overall financial health and future outlook based on these trends
+        
+        Keep the analysis professional yet accessible for retail investors.
+        Highlight any concerning trends or positive indicators.
+        Provide specific insights about each financial metric.
         """
+        
+        # Generate response
         response = model.generate_content(prompt)
         return response.text
+        
     except Exception as e:
-        return f"AI analysis failed: {str(e)}"
+        return f"Error generating analysis: {str(e)}. Please check your API key and try again."
 
-# === MAIN EXECUTION ===
-try:
-    symbol = get_stock_symbol(stock_name)
-    st.info(f"🔍 Analyzing: **{stock_name.title()}** ({symbol})")
+# Function to create visualizations
+def create_visualizations(financial_data, company_name):
+    # Create subplots
+    fig = make_subplots(
+        rows=3, cols=2,
+        subplot_titles=('Sales Trend (₹ Crores)', 'Operating Profit (₹ Crores)', 
+                       'OPM%', 'Net Profit (₹ Crores)', 'EPS'),
+        specs=[[{"secondary_y": False}, {"secondary_y": False}],
+               [{"secondary_y": False}, {"secondary_y": False}],
+               [{"secondary_y": False}, {"secondary_y": False}]]
+    )
+    
+    quarters = financial_data.index
+    
+    # Sales trend
+    fig.add_trace(
+        go.Scatter(x=quarters, y=financial_data['Sales'], name='Sales', 
+                  line=dict(color='blue', width=3), marker=dict(size=8)),
+        row=1, col=1
+    )
+    
+    # Operating Profit
+    fig.add_trace(
+        go.Scatter(x=quarters, y=financial_data['Operating Profit'], name='Operating Profit', 
+                  line=dict(color='green', width=3), marker=dict(size=8)),
+        row=1, col=2
+    )
+    
+    # OPM%
+    fig.add_trace(
+        go.Scatter(x=quarters, y=financial_data['OPM%'], name='OPM%', 
+                  line=dict(color='red', width=3), marker=dict(size=8)),
+        row=2, col=1
+    )
+    
+    # Net Profit
+    fig.add_trace(
+        go.Scatter(x=quarters, y=financial_data['Net Profit'], name='Net Profit', 
+                  line=dict(color='purple', width=3), marker=dict(size=8)),
+        row=2, col=2
+    )
+    
+    # EPS
+    fig.add_trace(
+        go.Scatter(x=quarters, y=financial_data['EPS'], name='EPS', 
+                  line=dict(color='orange', width=3), marker=dict(size=8)),
+        row=3, col=1
+    )
+    
+    # Hide empty subplot
+    fig.add_trace(go.Scatter(x=[None], y=[None], showlegend=False), row=3, col=2)
+    
+    # Update layout
+    fig.update_layout(
+        height=800,
+        title_text=f"{company_name} - Financial Performance Trends (Last 10 Quarters)",
+        showlegend=True,
+        template="plotly_white"
+    )
+    
+    # Update y-axis titles
+    fig.update_yaxes(title_text="₹ Crores", row=1, col=1)
+    fig.update_yaxes(title_text="₹ Crores", row=1, col=2)
+    fig.update_yaxes(title_text="Percentage", row=2, col=1)
+    fig.update_yaxes(title_text="₹ Crores", row=2, col=2)
+    fig.update_yaxes(title_text="Earnings per Share", row=3, col=1)
+    
+    return fig
 
-    raw_data = fetch_quarterly_financials(symbol)
-    if raw_data.empty or len(raw_data) == 0:
-        st.error("❌ No financial data found. Please check the stock name.")
+# Function to calculate growth metrics
+def calculate_growth_metrics(financial_data):
+    growth_data = {}
+    
+    # Calculate quarter-over-quarter growth
+    for column in financial_data.columns:
+        if column != 'OPM%':  # OPM% is already a percentage
+            growth_data[f'{column} QoQ Growth'] = financial_data[column].pct_change() * 100
+        else:
+            growth_data[f'{column} Change'] = financial_data[column].diff()
+    
+    growth_df = pd.DataFrame(growth_data, index=financial_data.index)
+    growth_df = growth_df.round(2)
+    
+    return growth_df
+
+# Main app
+col1, col2 = st.columns([3, 1])
+with col1:
+    symbol = st.text_input("Enter Indian Stock Symbol (e.g., RELIANCE.NS):", "RELIANCE.NS")
+with col2:
+    st.write("")
+    st.write("")
+    analyze_btn = st.button("Analyze Stock", type="primary")
+
+if analyze_btn or st.session_state.financial_data is not None:
+    if symbol:
+        with st.spinner("Fetching financial data..."):
+            financial_data, company_name = fetch_stock_data(symbol)
+        
+        if financial_data is not None:
+            st.session_state.financial_data = financial_data
+            st.session_state.company_name = company_name
+            
+            st.success(f"Financial data retrieved for {company_name}!")
+            
+            # Display the financial data
+            st.subheader("Financial Data (Last 10 Quarters)")
+            display_df = financial_data.copy()
+            display_df['Sales'] = display_df['Sales'].apply(lambda x: f"₹ {x:,.2f} Cr")
+            display_df['Operating Profit'] = display_df['Operating Profit'].apply(lambda x: f"₹ {x:,.2f} Cr")
+            display_df['OPM%'] = display_df['OPM%'].apply(lambda x: f"{x:.2f}%")
+            display_df['Net Profit'] = display_df['Net Profit'].apply(lambda x: f"₹ {x:,.2f} Cr")
+            display_df['EPS'] = display_df['EPS'].apply(lambda x: f"₹ {x:.2f}")
+            
+            st.dataframe(display_df, use_container_width=True)
+            
+            # Calculate and display growth metrics
+            st.subheader("Growth Metrics")
+            growth_df = calculate_growth_metrics(financial_data)
+            st.dataframe(growth_df.style.format("{:.2f}%"), use_container_width=True)
+            
+            # Create and display visualizations
+            st.subheader("Financial Trends")
+            fig = create_visualizations(financial_data, company_name)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Generate and display analysis
+            st.subheader("AI-Powered Financial Analysis")
+            if st.button("Generate Analysis", type="secondary"):
+                with st.spinner("Generating analysis using Gemini AI..."):
+                    analysis = generate_analysis(company_name, financial_data)
+                
+                st.write(analysis)
+            
+        else:
+            st.error(company_name)  # In this case, company_name contains the error message
     else:
-        display_data = format_numbers(raw_data)
+        st.warning("Please enter a stock symbol.")
 
-        # Metrics
-        st.markdown('<h2 class="sub-header">📈 Key Metrics</h2>', unsafe_allow_html=True)
-        cols = st.columns(5)
-        latest = raw_data.iloc[0]
-        metrics = [
-            ("Sales", f"₹{latest['Sales']/1e7:.2f} Cr" if pd.notnull(latest['Sales']) else "N/A"),
-            ("Op Profit", f"₹{latest['Operating_Profit']/1e7:.2f} Cr" if pd.notnull(latest['Operating_Profit']) else "N/A"),
-            ("OPM %", f"{latest['OPM_Percent']:.2f}%" if pd.notnull(latest['OPM_Percent']) else "N/A"),
-            ("Net Profit", f"₹{latest['Net_Profit']/1e7:.2f} Cr" if pd.notnull(latest['Net_Profit']) else "N/A"),
-            ("EPS", f"₹{latest['EPS']:.2f}" if pd.notnull(latest['EPS']) else "N/A")
-        ]
-        for col, (label, value) in zip(cols, metrics):
-            with col:
-                st.markdown(f'<div class="metric-card"><b>{label}</b><br>{value}</div>', unsafe_allow_html=True)
+# Add some information about the app
+st.markdown("---")
+st.markdown("""
+### How to Use This Tool:
+1. Enter an Indian stock symbol with the `.NS` suffix (for NSE-listed companies)
+2. Click the "Analyze Stock" button to fetch financial data
+3. View the financial metrics and visualizations
+4. Get AI-powered analysis by providing your Gemini API key and clicking "Generate Analysis"
 
-        # Table
-        st.markdown('<h2 class="sub-header">📋 Quarterly Data</h2>', unsafe_allow_html=True)
-        st.dataframe(display_data, use_container_width=True)
+### Popular Indian Stock Symbols:
+- RELIANCE.NS (Reliance Industries)
+- TCS.NS (Tata Consultancy Services)
+- INFY.NS (Infosys)
+- HDFCBANK.NS (HDFC Bank)
+- SBIN.NS (State Bank of India)
+- ICICIBANK.NS (ICICI Bank)
+- HINDUNILVR.NS (Hindustan Unilever)
+- BAJFINANCE.NS (Bajaj Finance)
 
-        # Charts
-        st.markdown('<h2 class="sub-header">📊 Financial Trends</h2>', unsafe_allow_html=True)
-        fig = create_visualizations(raw_data)
-        st.pyplot(fig)
+### Data Source:
+Financial data is sourced from Yahoo Finance using the yfinance library.
 
-        # AI Analysis
-        st.markdown('<h2 class="sub-header">🤖 AI Analysis</h2>', unsafe_allow_html=True)
-        with st.spinner("Generating AI insights..."):
-            ai_input = prepare_ai_analysis_data(raw_data)
-            ai_result = get_ai_analysis(ai_input, api_key)
-            st.markdown(ai_result)
-
-except Exception as e:
-    st.error(f"❌ Error: {str(e)}")
-
-# Footer
-st.markdown('<div class="footer">📊 Indian Stock Analyzer | Data: Yahoo Finance | AI: Gemini</div>', unsafe_allow_html=True)
+### Note:
+This tool is for educational purposes only. Always consult with a financial advisor before making investment decisions.
+""")
